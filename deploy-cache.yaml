@@ -1,0 +1,216 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: s3-js-gateway
+  namespace: altinity-cloud-managed-clickhouse
+data:
+  s3gateway.js: |
+    function redirectToS3(r) {
+        if (r.headersIn["Range"]) {
+            r.internalRedirect("@s3_sliced");
+        } else {
+            r.internalRedirect("@s3");
+        }
+    }
+    
+    export default {
+      redirectToS3
+    }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: s3-cache-config
+  namespace: altinity-cloud-managed-clickhouse
+data:
+  nginx.conf: |
+    user  nginx;
+    worker_processes auto;
+
+    error_log  /dev/stdout info;
+    pid        /var/run/nginx.pid;
+
+    load_module modules/ngx_http_js_module.so;
+
+    events {
+        worker_connections  1024;
+    }
+
+    http {
+        include       /etc/nginx/mime.types;
+        default_type  application/octet-stream;
+
+        log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+        '$status $body_bytes_sent "$http_referer" '
+        '"$http_user_agent" "$http_x_forwarded_for"';
+
+        access_log  /var/log/nginx/access.log  main;
+
+        sendfile        on;
+        #tcp_nopush     on;
+
+        keepalive_timeout  65;
+
+        #gzip  on;
+
+        include /etc/nginx/conf.d/*.conf;
+    }
+  cache.conf: |    
+    js_import /etc/nginx/include/s3gateway.js;
+    
+    proxy_temp_path /data/nginx/nginx_tmp 1 2;
+    
+    proxy_cache_path /data/nginx/s3_proxy
+      levels=1:2
+      keys_zone=s3_cache:500m
+      max_size=400g
+      inactive=30d
+      use_temp_path=off;
+  
+    proxy_cache_path /data/nginx/s3_proxy_slices
+      levels=1:2
+      keys_zone=s3_cache_slices:500m
+      max_size=400g
+      inactive=30d
+      use_temp_path=off;
+
+    log_format rt_cache '$remote_addr - $upstream_cache_status [$time_local]  '
+                        '"$request" $status $body_bytes_sent '
+                        '"$http_referer" "$http_user_agent"';
+    
+    access_log /var/log/nginx/access.log rt_cache;
+    
+    resolver kube-dns.kube-system.svc.cluster.local ipv6=off;
+    
+    server {
+      listen 8080;    
+      
+      proxy_http_version 1.1;
+      proxy_set_header Host s3.us-east-2.amazonaws.com;
+      proxy_set_header Authorization $http_authorization;
+      proxy_set_header Connection '';
+      proxy_buffering on;      
+
+      proxy_cache s3_cache;
+      proxy_cache_valid 200 30d;
+      proxy_cache_valid 404  1m;
+      proxy_cache_use_stale error timeout invalid_header updating http_500 http_502 http_503 http_504;
+      proxy_cache_lock on;      
+      
+      add_header X-Cache-Status $upstream_cache_status always;
+      set $s3_host 's3.us-east-2.amazonaws.com';
+
+      location / {        
+        js_content s3gateway.redirectToS3;
+      }
+    
+      location @s3 {       
+        proxy_pass https://$s3_host;        
+      }
+
+      # Same as the primary location above but handling and caching
+      # byte range requests efficiently
+      location @s3_sliced {
+        proxy_cache s3_cache_slices;
+        proxy_cache_valid 200 302 206 30d;
+        proxy_cache_key "$request_method$host$uri$slice_range";
+
+        slice              4m;
+        proxy_set_header   Range $slice_range;
+        proxy_pass https://$s3_host; 
+      } 
+  
+      location = /health {
+        access_log off;
+        add_header 'Content-Type' 'application/json';
+        return 200 '{"status":"UP"}';
+      }
+    }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nginx-cache-pvc
+  namespace: altinity-cloud-managed-clickhouse
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: local-path
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s3-cache
+  namespace: altinity-cloud-managed-clickhouse
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: s3-cache
+  template:
+    metadata:
+      labels:
+        app: s3-cache
+    spec:
+      nodeSelector:
+        node.kubernetes.io/instance-type: m7gd.2xlarge
+      tolerations:
+        - key: "dedicated"
+          operator: "Equal"
+          value: "s3-cache"
+          effect : "NoSchedule"
+      containers:
+        - name: nginx
+          image: nginx:1.27.4
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nginx/conf.d/cache.conf
+              subPath: cache.conf
+            - name: config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+            - name: js
+              mountPath: /etc/nginx/include/s3gateway.js
+              subPath: s3gateway.js
+            - name: cache
+              mountPath: /data/nginx
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+      volumes:
+        - name: config
+          configMap:
+            name: s3-cache-config
+        - name: js
+          configMap:
+            name: s3-js-gateway
+        - name: cache
+          persistentVolumeClaim:
+              claimName: nginx-cache-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: s3-cache
+  namespace: altinity-cloud-managed-clickhouse
+spec:
+  selector:
+    app: s3-cache
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: http
