@@ -1,0 +1,14 @@
+
+
+services:
+  clickhouse:
+    image: "altinity/clickhouse-server:24.12.2.20203.altinityantalya"
+    container_name: clickhouse
+    depends_on:
+      - nginx
+  nginx:
+    image: nginx:1.27.4
+    volumes:
+      - ./nginx/default.local.conf:/etc/nginx/nginx.conf
+    ports:
+      - '8080:8080'
