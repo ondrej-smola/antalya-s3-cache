@@ -1,0 +1,12 @@
+
+<clickhouse>
+    <proxy>
+        <disable_tunneling_for_https_requests_over_http_proxy>1</disable_tunneling_for_https_requests_over_http_proxy>
+        <https>
+            <uri>http://nginx</uri>
+        </https>
+        <http>
+            <uri>http://nginx</uri>
+        </http>
+    </proxy>
+</clickhouse>
