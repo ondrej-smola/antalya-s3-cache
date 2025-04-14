@@ -222,7 +222,7 @@ spec:
             - name: PROXY_CACHE_VALID_OK
               value: "30d"
             - name: PROXY_CACHE_VALID_LIST_OK
-              value: "1m"
+              value: "5m"
             - name: PROXY_CACHE_VALID_NOT_FOUND
               value: "1m"
             - name: PROXY_CACHE_SLICE
