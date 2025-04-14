@@ -5,16 +5,39 @@ metadata:
   namespace: altinity-cloud-managed-clickhouse
 data:
   s3gateway.js: |
+    const DEFAULT_REGION = process.env['DEFAULT_S3_REGION']
+    
     function redirectToS3(r) {
-        if (r.headersIn["Range"]) {
+        if (r.args['list-type']) {
+            r.internalRedirect('@s3_list')
+        } else if (r.headersIn["Range"]) {
             r.internalRedirect("@s3_sliced");
         } else {
             r.internalRedirect("@s3");
         }
     }
     
+    function s3Host(r) {
+        const host = r.headersIn['Host'];
+        const match = host.match(/^([^\.]+)\.s3(?:\.([^.]+))?\.amazonaws\.com$/);
+        
+        if (!match) {
+            throw (`Failed to parse bucket name from host ${host}`);
+        }            
+        
+        const bucketName = match[1];
+        const region = match[2] || DEFAULT_REGION;
+        
+        if (!region) {
+            throw (`Failed to parse region from host ${host} and no default one set`);
+        }
+        
+        return `${bucketName}.s3.${region}.amazonaws.com`;
+    }
+    
     export default {
-      redirectToS3
+        redirectToS3,
+        s3Host
     }
 ---
 apiVersion: v1
@@ -24,6 +47,8 @@ metadata:
   namespace: altinity-cloud-managed-clickhouse
 data:
   nginx.conf: |
+    env DEFAULT_S3_REGION;
+    
     user  nginx;
     worker_processes auto;
 
@@ -31,7 +56,8 @@ data:
     pid        /var/run/nginx.pid;
 
     load_module modules/ngx_http_js_module.so;
-
+    
+    
     events {
         worker_connections  1024;
     }
@@ -55,22 +81,22 @@ data:
 
         include /etc/nginx/conf.d/*.conf;
     }
-  cache.conf: |    
+  cache.conf: |
     js_import /etc/nginx/include/s3gateway.js;
     
     proxy_temp_path /data/nginx/nginx_tmp 1 2;
     
     proxy_cache_path /data/nginx/s3_proxy
       levels=1:2
-      keys_zone=s3_cache:500m
-      max_size=400g
+      keys_zone=s3_cache:50m
+      max_size=${PROXY_CACHE_SIZE}
       inactive=30d
       use_temp_path=off;
-  
+    
     proxy_cache_path /data/nginx/s3_proxy_slices
       levels=1:2
-      keys_zone=s3_cache_slices:500m
-      max_size=400g
+      keys_zone=s3_cache_slices:50m
+      max_size=${PROXY_CACHE_SIZE}
       inactive=30d
       use_temp_path=off;
 
@@ -79,65 +105,62 @@ data:
                         '"$http_referer" "$http_user_agent"';
     
     access_log /var/log/nginx/access.log rt_cache;   
-        
-    resolver kube-dns.kube-system.svc.cluster.local valid=300s ipv6=off;
+    
+    resolver ${DNS_RESOLVERS};
     
     server {
       listen 8080;    
     
-      set $s3_host 'aws-public-blockchain.s3.us-east-2.amazonaws.com';
+      js_set $s3_host s3gateway.s3Host;      
     
-      sendfile_max_chunk 0;
-      
-      proxy_http_version 1.1;
-      proxy_set_header Host $s3_host;
-      proxy_set_header Authorization $http_authorization;
-      proxy_set_header Connection '';
-      proxy_buffering on;        
-          
-      proxy_cache s3_cache;
-      proxy_cache_valid 200 30d;
-      proxy_cache_valid 404  1m;
-      proxy_cache_lock_age 30s;
-      # proxy_cache_use_stale error timeout invalid_header updating http_500 http_502 http_503 http_504;
-      proxy_cache_lock on;      
-      proxy_cache_methods GET HEAD;     
+      proxy_http_version      1.1;
+      proxy_set_header        Host $s3_host;
+      proxy_set_header        Authorization $http_authorization;
+      proxy_set_header        Connection '';
+      proxy_buffering         on;        
     
-      proxy_buffer_size 256k;
-      proxy_buffers 8 256k;
+      proxy_cache             s3_cache;
+      proxy_cache_valid       200 ${PROXY_CACHE_VALID_OK};
+      proxy_cache_valid       404 ${PROXY_CACHE_VALID_NOT_FOUND};      
+      proxy_cache_lock        on;      
+      proxy_cache_use_stale   error timeout invalid_header updating http_500 http_502 http_503 http_504;
+      proxy_cache_methods     GET HEAD;     
+    
+      proxy_buffer_size       256k;
+      proxy_buffers           8 256k;
       proxy_busy_buffers_size 512k;
-  
-      proxy_ignore_client_abort on;
-  
-      proxy_read_timeout 300s;
-      proxy_send_timeout 300s;
-      client_body_timeout 300s;
-      client_header_timeout 300s;        
+    
+      proxy_ignore_client_abort on;        
 
       location / {        
-        js_content s3gateway.redirectToS3;
+        js_content            s3gateway.redirectToS3;
       }
     
       location @s3 {       
-        proxy_pass https://$s3_host;        
+        proxy_pass            https://$s3_host;        
       }
 
-      # Same as the primary location above but handling and caching
-      # byte range requests efficiently
       location @s3_sliced {
-        proxy_cache s3_cache_slices;
-        proxy_cache_valid 200 302 206 30d;
-        proxy_cache_key "$request_method$host$uri$slice_range";
+        proxy_cache           s3_cache_slices;
+        proxy_cache_valid     200 302 206 ${PROXY_CACHE_VALID_OK};
+        slice                 ${PROXY_CACHE_SLICE};
+        proxy_cache_key       "$request_method$host$uri$slice_range";
 
-        slice              2m;
-        proxy_set_header   Range $slice_range;
-        proxy_pass https://$s3_host; 
-      } 
-  
+        proxy_set_header      Range $slice_range;
+        proxy_pass            https://$s3_host; 
+      }
+    
+      location @s3_list {
+        proxy_cache_lock      on;   
+        proxy_cache_valid     200 ${PROXY_CACHE_VALID_LIST_OK};
+        proxy_cache_key       "$request_method$host$uri$is_args$args";
+        proxy_pass            https://$s3_host;
+      }      
+    
       location = /health {
-        access_log off;
-        add_header 'Content-Type' 'application/json';
-        return 200 '{"status":"UP"}';
+        access_log            off;
+        add_header            'Content-Type' 'application/json';
+        return 200            '{"status":"UP"}';
       }
     }
 ---
@@ -157,6 +180,8 @@ spec:
       labels:
         app: s3-cache
     spec:
+      nodeSelector:
+        node.kubernetes.io/instance-type: r8g.large
       affinity:
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -164,13 +189,6 @@ spec:
                 matchLabels:
                   app: s3-cache
               topologyKey: kubernetes.io/hostname
-      nodeSelector:
-        node.kubernetes.io/instance-type: m7g.xlarge
-      tolerations:
-        - key: "dedicated"
-          operator: "Equal"
-          value: "clickhouse"
-          effect: "NoSchedule"
       containers:
         - name: nginx
           image: nginx:1.27.4
@@ -178,21 +196,45 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
+          command: [ "/bin/sh", "-c" ]
+          args:
+            - |
+              if [ -z ${DNS_RESOLVERS+x} ]; then
+                export DNS_RESOLVERS="$(cat /etc/resolv.conf | grep nameserver | cut -d' ' -f2 | xargs)"
+              fi              
+              defined_envs=$(printf '${%s} ' $(env | cut -d= -f1))
+              envsubst "$defined_envs" < /etc/nginx-template/conf.d/cache.conf > /etc/nginx/conf.d/cache.conf
+              cat -n /etc/nginx/conf.d/cache.conf
+              /docker-entrypoint.sh nginx -g "daemon off;"
           volumeMounts:
-            - name: config
-              mountPath: /etc/nginx/conf.d/cache.conf
-              subPath: cache.conf
             - name: config
               mountPath: /etc/nginx/nginx.conf
               subPath: nginx.conf
+            - name: config
+              mountPath: /etc/nginx-template/conf.d/cache.conf
+              subPath: cache.conf
             - name: js
               mountPath: /etc/nginx/include/s3gateway.js
               subPath: s3gateway.js
             - name: cache
               mountPath: /data/nginx
+          env:
+            - name: PROXY_CACHE_VALID_OK
+              value: "30d"
+            - name: PROXY_CACHE_VALID_LIST_OK
+              value: "1m"
+            - name: PROXY_CACHE_VALID_NOT_FOUND
+              value: "1m"
+            - name: PROXY_CACHE_SLICE
+              value: "16m"
+            - name: PROXY_CACHE_SIZE
+              value: "100g"
+            - name: DEFAULT_S3_REGION
+              value: "us-east-2"
           resources:
             requests:
-              cpu: 2000m
+              cpu: "1"
+              memory: 8Gi
           livenessProbe:
             httpGet:
               path: /health
@@ -204,6 +246,8 @@ spec:
               port: http
             periodSeconds: 10
       volumes:
+        - name: generated
+          emptyDir: { }
         - name: config
           configMap:
             name: s3-cache-config
@@ -214,12 +258,12 @@ spec:
     - metadata:
         name: cache
       spec:
+        storageClassName: gp3-encrypted-1000
         accessModes:
           - ReadWriteOnce
         resources:
           requests:
-            storage: 550Gi
-        storageClassName: gp3-encrypted-1000
+            storage: 120Gi
 ---
 apiVersion: v1
 kind: Service
