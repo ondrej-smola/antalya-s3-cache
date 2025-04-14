@@ -2,21 +2,21 @@
 
 
 1. Update `cache.yaml` `s3-cache` deployment (optional)
-   * Update/remove nodeSelector (prefer VMs with fast network and storage), also      
+   * Update/remove nodeSelector (prefer VMs with fast network and storage)     
      ```
      nodeSelector:
         node.kubernetes.io/instance-type: r8g.large
      ```
    * Env configuration
    
-   | Environment Variable         | Description                                                    | Default Value |
-   |------------------------------|----------------------------------------------------------------|---------------|
-   | `PROXY_CACHE_VALID_OK`       | Cache validity duration for HTTP 200 responses.                | `30d`         |
-   | `PROXY_CACHE_VALID_LIST_OK`  | Cache validity duration for list operations.                   | `1m`          |
-   | `PROXY_CACHE_VALID_NOT_FOUND`| Cache validity duration for HTTP 404 responses.                | `1m`          |
-   | `PROXY_CACHE_SLICE`          | Size of cache slices for s3 range queires                      | `16m`         |
-   | `PROXY_CACHE_SIZE`           | Maximum size of the proxy cache, should be less than PVC size  | `100g`        |
-   | `DEFAULT_S3_REGION`          | Default AWS S3 region.                                         | `us-east-2`   |
+   | Environment Variable         | Description                                                   | Default Value |
+   |------------------------------|---------------------------------------------------------------|---------------|
+   | `PROXY_CACHE_VALID_OK`       | Cache validity duration for HTTP 200 responses.               | `30d`         |
+   | `PROXY_CACHE_VALID_LIST_OK`  | Cache validity duration for list operations.                  | `1m`          |
+   | `PROXY_CACHE_VALID_NOT_FOUND`| Cache validity duration for HTTP 404 responses.               | `1m`          |
+   | `PROXY_CACHE_SLICE`          | Size of cache slices for s3 range queries                     | `16m`         |
+   | `PROXY_CACHE_SIZE`           | Maximum size of the proxy cache, should be less than PVC size | `100g`        |
+   | `DEFAULT_S3_REGION`          | Default AWS S3 region.                                        | `us-east-2`   |
    
    
 
